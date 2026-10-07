@@ -1,0 +1,28 @@
+[package]
+name = "java-bytecode"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Read, edit and write Java class files (JVMS class file format)"
+license = "Unlicense"
+authors = ["Burning_TNT"]
+keywords = ["jvm", "java", "bytecode", "classfile", "parser"]
+categories = ["parser-implementations", "compilers"]
+
+[lib]
+name = "java_bytecode"
+path = "src/lib.rs"
+
+[dependencies]
+bitflags = "2"
+thiserror = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = true
