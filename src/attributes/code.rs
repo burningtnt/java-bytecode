@@ -1,6 +1,6 @@
 //! `Code` attribute (JVMS §4.7.3).
 
-use core::ops::{Deref, DerefMut};
+use core::ops::RangeBounds;
 
 use super::{Attribute, AttributeBody, parse_attributes, write_attributes};
 use crate::bytecode::{self, Instruction};
@@ -192,8 +192,9 @@ impl<'a> CodeAttribute<'a> {
 
     /// Decodes the bytecode into a mutable [`Instructions`] view.
     ///
-    /// The returned view dereferences to `Vec<Instruction<'a>>`; edit it and
-    /// call [`Instructions::apply`] to re-encode and write the bytes back.
+    /// Edit the body through the view's `insert`/`remove`/`replace`/`splice`
+    /// methods (which keep branch and switch offsets consistent), then call
+    /// [`Instructions::apply`] to re-encode and write the bytes back.
     ///
     /// This is the safe path for modifying bytecode.
     pub fn instructions_mut(&mut self) -> Result<Instructions<'a, '_>> {
@@ -269,9 +270,14 @@ impl<'a> CodeAttribute<'a> {
 
 /// A mutable view of a method's decoded instructions.
 ///
-/// It dereferences to `Vec<Instruction<'a>>`, so the instruction list can be
-/// edited directly. Call [`Instructions::apply`] to re-encode the instructions
-/// and store the resulting bytes back into the [`CodeAttribute`].
+/// The instruction list is private: read it through [`Instructions::as_slice`],
+/// [`Instructions::get`] or [`Instructions::iter`], and edit it through
+/// [`Instructions::insert`], [`Instructions::remove`] or
+/// [`Instructions::replace`] (or the general [`Instructions::splice`]). Those
+/// editing methods operate on the internal list and rebase branch and switch
+/// offsets so that existing targets keep pointing at the same instructions.
+/// Call [`Instructions::apply`] to re-encode the instructions and store the
+/// resulting bytes back into the [`CodeAttribute`].
 ///
 /// The first lifetime `'a` is the constant-pool scope carried by the
 /// instructions (needed to intern or reference constants); the second is the
@@ -286,6 +292,10 @@ impl<'a, 'code> Instructions<'a, 'code> {
     /// Encodes the instructions and writes the bytes back into the `Code`
     /// attribute.
     ///
+    /// Branch and switch offsets are already consistent with the current
+    /// instruction list (the editing methods rebased them); this only performs
+    /// the raw encoding.
+    ///
     /// # Errors
     ///
     /// Fails if an instruction cannot be encoded (for example an `ldc` whose
@@ -296,30 +306,138 @@ impl<'a, 'code> Instructions<'a, 'code> {
         Ok(())
     }
 
+    /// Replaces instructions in `range` with `replacement`, returning the
+    /// removed instructions.
+    ///
+    /// This is the primitive behind [`Instructions::insert`],
+    /// [`Instructions::remove`] and [`Instructions::replace`]. It rebases every
+    /// branch and switch offset so that existing targets keep pointing at the
+    /// same logical instruction:
+    ///
+    /// * the relative offsets carried by `replacement` are interpreted in the
+    ///   *original* layout — the replacement sequence is laid out starting at
+    ///   `range.start`, so a supplied branch may reference an instruction that
+    ///   already existed before the edit;
+    /// * offsets that pointed into the removed range are moved forward to the
+    ///   first instruction after the replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InstructionIndexOutOfRange`](crate::Error::InstructionIndexOutOfRange)
+    /// if `range` is invalid or out of bounds, and
+    /// [`Error::RelativeOffsetOutOfRange`](crate::Error::RelativeOffsetOutOfRange)
+    /// if a rebased `i16`/`i32` offset would overflow. On error the view is
+    /// left unchanged.
+    pub fn splice<R>(
+        &mut self,
+        range: R,
+        replacement: impl IntoIterator<Item = Instruction<'a>>,
+    ) -> Result<Vec<Instruction<'a>>>
+    where
+        R: RangeBounds<usize>,
+    {
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&start) => start,
+            core::ops::Bound::Excluded(&start) => start + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&end) => end + 1,
+            core::ops::Bound::Excluded(&end) => end,
+            core::ops::Bound::Unbounded => self.instructions.len(),
+        };
+        let replacement: Vec<Instruction<'a>> = replacement.into_iter().collect();
+        bytecode::splice(&mut self.instructions, start..end, replacement)
+    }
+
+    /// Inserts `instruction` at `index`, shifting the following instructions.
+    ///
+    /// Branch and switch offsets are rebased; see [`Instructions::splice`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Instructions::splice`].
+    pub fn insert(&mut self, index: usize, instruction: Instruction<'a>) -> Result<()> {
+        self.splice(index..index, [instruction]).map(|_| ())
+    }
+
+    /// Inserts `instructions` at `index`, shifting the following instructions.
+    ///
+    /// Branch and switch offsets are rebased; see [`Instructions::splice`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Instructions::splice`].
+    pub fn insert_all(
+        &mut self,
+        index: usize,
+        instructions: impl IntoIterator<Item = Instruction<'a>>,
+    ) -> Result<()> {
+        self.splice(index..index, instructions).map(|_| ())
+    }
+
+    /// Removes and returns the instruction at `index`.
+    ///
+    /// Branch and switch offsets are rebased; see [`Instructions::splice`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Instructions::splice`].
+    pub fn remove(&mut self, index: usize) -> Result<Instruction<'a>> {
+        let mut removed = self.splice(index..index + 1, [])?;
+        Ok(removed.remove(0))
+    }
+
+    /// Replaces the instruction at `index` with `instruction`, returning the
+    /// old instruction.
+    ///
+    /// Branch and switch offsets are rebased; see [`Instructions::splice`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`Instructions::splice`].
+    pub fn replace(
+        &mut self,
+        index: usize,
+        instruction: Instruction<'a>,
+    ) -> Result<Instruction<'a>> {
+        let mut removed = self.splice(index..index + 1, [instruction])?;
+        Ok(removed.remove(0))
+    }
+
     /// Returns the instructions without applying them.
     #[must_use]
     pub fn as_slice(&self) -> &[Instruction<'a>] {
         &self.instructions
     }
 
+    /// Returns the number of instructions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.instructions.len()
+    }
+
+    /// Returns `true` if there are no instructions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.instructions.is_empty()
+    }
+
+    /// Returns the instruction at `index`, or `None` if out of bounds.
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&Instruction<'a>> {
+        self.instructions.get(index)
+    }
+
+    /// Iterates over the instructions.
+    pub fn iter(&self) -> core::slice::Iter<'_, Instruction<'a>> {
+        self.instructions.iter()
+    }
+
     /// Consumes the view and returns the instructions.
     #[must_use]
     pub fn into_vec(self) -> Vec<Instruction<'a>> {
         self.instructions
-    }
-}
-
-impl<'a> Deref for Instructions<'a, '_> {
-    type Target = Vec<Instruction<'a>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.instructions
-    }
-}
-
-impl DerefMut for Instructions<'_, '_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.instructions
     }
 }
 

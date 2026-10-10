@@ -54,7 +54,7 @@ Operational guide for AI coding assistants working on `java-bytecode`. Imperativ
 ### Editing bytecode
 - `CodeAttribute.code` is private. Edit only via `instructions_mut()` + `Instructions::apply()`; read via `instructions()`.
 - Internally call `bytecode::decode_impl` / `encode_impl`; `bytecode::decode`/`encode`/`encode_into` are `unsafe` and public only as escape hatches.
-- ✅ `let mut i = code.instructions_mut()?; i.insert(0, ins); i.apply()?;`
+- ✅ `let mut i = code.instructions_mut()?; i.insert(0, ins)?; i.apply()?;`
 - ❌ `code.code = encoded;` (field private) or calling `unsafe { encode(..) }` in library code.
 
 ### unsafe

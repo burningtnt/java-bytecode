@@ -121,11 +121,12 @@
 //!
 //! Editing a method's code goes through
 //! [`CodeAttribute::instructions_mut`], which returns an [`Instructions`] view
-//! scoped to the class's constant pool. It dereferences to
-//! `Vec<Instruction<'a>>`; edit the vector and call [`Instructions::apply`] to
-//! re-encode and write the bytes back. New constants are added with
-//! [`ConstantPool::intern`] / [`ConstantPool::intern_utf8`]. You remain
-//! responsible for rebasing branch offsets, the exception table and the
+//! scoped to the class's constant pool. Use its `insert`/`remove`/`replace`
+//! methods (or the general `splice`) to change the body; they rebase branch and
+//! switch offsets so existing targets keep pointing at the same instructions.
+//! Call [`Instructions::apply`] to re-encode and write the bytes back. New
+//! constants are added with [`ConstantPool::intern`] / [`ConstantPool::intern_utf8`].
+//! You remain responsible for the exception table, the debug tables and the
 //! `StackMapTable` when the code size changes.
 //!
 //! The [`bytecode`] module documents the full workflow, including a complete,

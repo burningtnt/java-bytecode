@@ -9,7 +9,7 @@
 - **零拷贝读取**：`ClassFile<'a>` 借用输入字节，所有变长数据（`Utf8`、未知属性体、字节码等）都以 `&'a` 形式借用，解析不复制。
 - **不透明索引**：常量池下标是 `ConstantRef<'a>`（`#[repr(transparent)]` 包裹 `u16`）。它带生命周期标记且对 `'a` 不变，因此**无法把一个类的下标用到另一个类上**。仅提供 `unsafe` 的 `from_raw` / `into_raw` 逃逸口。
 - **Modified UTF-8 封装**：`Mutf8<'a>` 替代裸 `&[u8]`，可直接与 `str` / `String` / `&[u8]` 比较并互转；通过 `TryFrom` 校验构造，另有 `unsafe from_bytes_unchecked`。
-- **可编辑字节码**：`CodeAttribute::instructions_mut()` 返回作用域绑定的 `Instructions<'a, '_>` 视图（`Deref` 到 `Vec<Instruction<'a>>`），`apply()` 自动重新编码并写回。
+- **可编辑字节码**：`CodeAttribute::instructions_mut()` 返回作用域绑定的 `Instructions<'a, '_>` 视图。用它的 `insert` / `remove` / `replace` / `splice` 修改方法体，分支与 switch 偏移会自动重定位；`apply()` 重新编码并写回。
 - **常量池重建**：`to_bytes()` 保序（索引稳定）；`to_bytes_rebuilt()` 压缩并去重常量池，重写包括字节码在内的全部索引。
 - **不做语义校验**：只做结构解析，不实现 §4.8/§4.9/§4.10 的校验；畸形输入返回 `Error` 而非 panic。
 
@@ -19,7 +19,7 @@
 - **`ConstantRef<'a>`**：由 `ConstantPool::push` / `intern` / `intern_utf8` 返回；`get` / `utf8` / `utf8_str` 等接收该类型。`intern_utf8` 直接接受 `&'a str`，内部完成 `Mutf8::try_from` 校验。
 - **常量池槽位**：`ConstantPool` 内部用 `Vec<Constant<'a>>` 表示，0 号槽以及 `Long`/`Double` 的第二槽是 `Constant::Invalid` 占位符（不会被序列化）。
 - **`Mutf8<'a>`**：`Constant::Utf8`、`ConstantPool::utf8`、`SourceDebugExtension`、`FieldType::Object`、名称校验等均使用它。
-- **`Instructions` + `apply`**：编辑字节码的正道；`bytecode::decode` / `encode` 因无法管理常量池下标而为 `unsafe`，仅作底层/高级用途。
+- **`Instructions` + `apply`**：编辑字节码的正道，`insert` / `remove` / `replace` / `splice` 会自动重定位分支与 switch 偏移；`bytecode::decode` / `encode` 因无法管理常量池下标而为 `unsafe`，仅作底层/高级用途。
 
 ## 快速开始
 
@@ -44,7 +44,7 @@ fn main() -> Result<(), java_bytecode::Error> {
 }
 ```
 
-插桩（在 `voidMethod()V` 前插入对 `example/Hook.entry()V` 的调用）：
+插桩（在 `int dense(int)` 的方法头插入对 `example/Hook.entry()V` 的调用）：
 
 ```rust
 use java_bytecode::{ClassFile, Constant, Instruction, Opcode};
@@ -68,15 +68,15 @@ fn instrument(bytes: &[u8]) -> Result<Vec<u8>, java_bytecode::Error> {
         name_and_type_index: name_and_type,
     })?;
 
-    // 2. 通过作用域绑定的视图编辑并写回。
+    // 2. 通过作用域绑定的视图编辑并写回；分支/switch 偏移自动重定位。
     {
         let code = class
-            .find_method_mut("voidMethod", "()V")
+            .find_method_mut("dense", "(I)I")
             .expect("method not found")
             .code_mut()
             .expect("method has no Code");
         let mut instructions = code.instructions_mut()?;
-        instructions.insert(0, Instruction::ConstantWide(Opcode::Invokestatic, method_ref));
+        instructions.insert(0, Instruction::ConstantWide(Opcode::Invokestatic, method_ref))?;
         instructions.apply()?;
     }
 
@@ -85,7 +85,7 @@ fn instrument(bytes: &[u8]) -> Result<Vec<u8>, java_bytecode::Error> {
 }
 ```
 
-> 注意：`apply()` 只负责重新编码字节码。改变代码长度后，分支/switch 偏移、异常表、调试表与 `StackMapTable` 需由调用方自行处理。
+> 注意：`insert` / `remove` / `replace` / `splice` 会重定位分支与 switch 偏移。异常表、调试表与 `StackMapTable` 仍由调用方负责；`max_stack` / `max_locals` 也需按需更新。
 
 ## 从零创建类
 

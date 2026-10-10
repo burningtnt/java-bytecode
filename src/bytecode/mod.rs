@@ -18,9 +18,9 @@
 //!    which deduplicate. The returned [`ConstantRef`] is what you embed in the
 //!    new instructions.
 //! 3. **Edit through [`crate::CodeAttribute::instructions_mut`].** It decodes the
-//!    bytecode into an [`Instructions<'a, '_>`](crate::Instructions) view that
-//!    dereferences to `Vec<Instruction<'a>>`, keeping the class's constant-pool
-//!    scope `'a`. Mutate the vector, then call
+//!    bytecode into an [`Instructions<'a, '_>`](crate::Instructions) view scoped
+//!    to the class's constant pool. Use its `insert`/`remove`/`replace`/`splice`
+//!    methods (which keep branch and switch offsets consistent), then call
 //!    [`crate::Instructions::apply`](crate::Instructions::apply) to re-encode the
 //!    instructions and write the bytes back into the `Code` attribute.
 //! 4. **Fix the metadata the verifier reads:** `max_stack`, `max_locals`, the
@@ -50,18 +50,24 @@
 //! are `unsafe` for the same reason and should be avoided in favour of
 //! [`crate::CodeAttribute::instructions_mut`] + [`crate::Instructions::apply`].
 //!
-//! ## What you must recompute
+//! ## What the editing API handles
 //!
-//! Decoding and encoding are byte-exact but *do not* relaunch offsets for you.
-//! Relative branch offsets and switch targets are stored exactly as they appear
-//! on the wire, so inserting or removing instructions invalidates them. After a
-//! size-changing edit you are responsible for:
+//! [`crate::CodeAttribute::instructions_mut`] returns a view whose
+//! `insert`/`remove`/`replace`/`splice` methods edit the internal instruction
+//! list and rebase every branch and switch offset so that existing targets keep
+//! pointing at the same logical instruction. Because switch padding depends on
+//! the instruction's position (see [`Instruction::encoded_len`]), inserting or
+//! removing bytes can change a switch's encoded length; that is accounted for.
 //!
-//! * **Branch and switch targets.** Convert each relative offset to an absolute
-//!   target (`target = instruction_pc + relative_offset`) before editing, then
-//!   back to a relative offset after. Note that switch padding depends on the
-//!   instruction's position (see [`Instruction::encoded_len`]), so relative
-//!   lengths can change when alignment changes.
+//! Relative offsets carried by instructions you supply are interpreted in the
+//! original (pre-edit) layout — the replacement sequence is treated as laid out
+//! at the splice point — so a newly inserted branch may reference an
+//! instruction that already existed. An offset that pointed at an instruction
+//! inside the removed range is moved forward to the first instruction after the
+//! replacement.
+//!
+//! ## What you must still recompute
+//!
 //! * **The exception table** (`start_pc`, `end_pc`, `handler_pc`).
 //! * **Debug tables** (`LineNumberTable`, `LocalVariableTable`,
 //!   `LocalVariableTypeTable`). Stale values are tolerated by the JVM but are
@@ -85,17 +91,18 @@
 //!
 //! ## Worked example
 //!
-//! The following prepends a call to a static hook at the start of a branch-free
-//! method. Because the method is just `return`, there are no branch offsets,
-//! exception entries or stack-map frames to fix, and `invokestatic` with the
-//! descriptor `()V` neither pops nor pushes, so `max_stack` is unchanged.
+//! The following reads an existing class and prepends a call to a static hook to
+//! `ControlFlow.dense(int)`. That method starts with `iload_1; tableswitch`, so
+//! inserting three bytes shifts the switch and grows its alignment padding by
+//! one; `insert` rebases the switch's case and default offsets so they still
+//! reach the same case bodies.
 //!
 //! ```
 //! use java_bytecode::{ClassFile, Constant, Instruction, Opcode};
 //!
 //! let input: &[u8] = include_bytes!(concat!(
 //!     env!("CARGO_MANIFEST_DIR"),
-//!     "/tests/fixtures/classes/main/example/Simple.class"
+//!     "/tests/fixtures/classes/main/example/ControlFlow.class"
 //! ));
 //! let mut class = ClassFile::parse(input).unwrap();
 //!
@@ -122,35 +129,60 @@
 //!     })
 //!     .unwrap();
 //!
-//! // 2. Edit through the scoped instructions view, then write it back.
+//! // 2. Record the tableswitch's default offset before editing.
+//! let default_before = {
+//!     let before = class
+//!         .find_method("dense", "(I)I")
+//!         .unwrap()
+//!         .code()
+//!         .unwrap()
+//!         .instructions()
+//!         .unwrap();
+//!     match &before[1] {
+//!         Instruction::TableSwitch { default, .. } => *default,
+//!         other => panic!("expected a tableswitch, got {:?}", other.opcode()),
+//!     }
+//! };
+//!
+//! // 3. Insert the hook at the head; branch/switch offsets are rebased.
 //! {
 //!     let code = class
-//!         .find_method_mut("voidMethod", "()V")
+//!         .find_method_mut("dense", "(I)I")
 //!         .unwrap()
 //!         .code_mut()
 //!         .unwrap();
 //!     let mut instructions = code.instructions_mut().unwrap();
-//!     instructions.insert(0, Instruction::ConstantWide(Opcode::Invokestatic, method_ref));
+//!     instructions
+//!         .insert(0, Instruction::ConstantWide(Opcode::Invokestatic, method_ref))
+//!         .unwrap();
 //!     instructions.apply().unwrap();
 //! }
 //!
-//! // 3. Serialize (index-stable) and confirm the hook is present.
+//! // 4. Serialize and confirm the hook and the rebased switch target.
 //! let output = class.to_bytes().unwrap();
-//! let mut reparsed = ClassFile::parse(&output).unwrap();
+//! let reparsed = ClassFile::parse(&output).unwrap();
 //! let loaded = reparsed
-//!     .find_method_mut("voidMethod", "()V")
+//!     .find_method("dense", "(I)I")
 //!     .unwrap()
-//!     .code_mut()
+//!     .code()
 //!     .unwrap()
-//!     .instructions_mut()
-//!     .unwrap()
-//!     .into_vec();
+//!     .instructions()
+//!     .unwrap();
 //! assert_eq!(loaded[0].opcode(), Opcode::Invokestatic);
+//! let default_after = match &loaded[2] {
+//!     Instruction::TableSwitch { default, .. } => *default,
+//!     other => panic!("expected a tableswitch, got {:?}", other.opcode()),
+//! };
+//! // The switch moved and its padding grew by one byte, so the default target
+//! // had to be rebased to keep reaching the same case body.
+//! assert_eq!(default_after, default_before + 1);
 //! ```
 
 pub mod opcode;
 
 pub use opcode::{Opcode, OperandKind};
+
+use core::ops::Range;
 
 use crate::constant_pool::ConstantRef;
 use crate::error::{Error, Result};
@@ -311,6 +343,206 @@ fn padding_len(pc: usize, stored: &[u8]) -> usize {
     } else {
         required
     }
+}
+
+/// Computes the start program counter of each instruction and the total length.
+fn layout(instructions: &[Instruction<'_>]) -> (Vec<usize>, usize) {
+    let mut pcs = Vec::with_capacity(instructions.len());
+    let mut pc = 0usize;
+    for instruction in instructions {
+        pcs.push(pc);
+        pc += instruction.encoded_len(pc);
+    }
+    (pcs, pc)
+}
+
+/// Pushes the absolute target program counters carried by `instruction`.
+///
+/// Targets are stored on the wire relative to the instruction's own offset;
+/// this resolves them to absolute offsets in `[0, code_len]`. Instructions
+/// without a branch target push nothing.
+fn resolve_targets(instruction: &Instruction<'_>, pc: usize, out: &mut Vec<i64>) {
+    let base = pc as i64;
+    match instruction {
+        Instruction::Branch(_, offset) => {
+            out.push(base + i64::from(*offset));
+        }
+        Instruction::BranchWide(_, offset) => {
+            out.push(base + i64::from(*offset));
+        }
+        Instruction::TableSwitch {
+            default, offsets, ..
+        } => {
+            out.push(base + i64::from(*default));
+            out.extend(offsets.iter().map(|offset| base + i64::from(*offset)));
+        }
+        Instruction::LookupSwitch { default, pairs, .. } => {
+            out.push(base + i64::from(*default));
+            out.extend(pairs.iter().map(|(_, offset)| base + i64::from(*offset)));
+        }
+        _ => {}
+    }
+}
+
+/// Writes remapped absolute target offsets back into `instruction`.
+///
+/// `targets` must be in the same order that [`resolve_targets`] produced them.
+/// An offset that does not fit its field is reported as
+/// [`Error::RelativeOffsetOutOfRange`].
+fn write_targets(instruction: &mut Instruction<'_>, pc: usize, targets: &[i64]) -> Result<()> {
+    let base = pc as i64;
+    let fit_i16 = |offset: i64| {
+        i16::try_from(offset).map_err(|_| Error::RelativeOffsetOutOfRange {
+            offset,
+            target: "i16 branch offset",
+        })
+    };
+    let fit_i32 = |offset: i64| {
+        i32::try_from(offset).map_err(|_| Error::RelativeOffsetOutOfRange {
+            offset,
+            target: "i32 branch offset",
+        })
+    };
+    match instruction {
+        Instruction::Branch(_, offset) => *offset = fit_i16(targets[0] - base)?,
+        Instruction::BranchWide(_, offset) => *offset = fit_i32(targets[0] - base)?,
+        Instruction::TableSwitch {
+            default, offsets, ..
+        } => {
+            *default = fit_i32(targets[0] - base)?;
+            for (slot, target) in offsets.iter_mut().zip(&targets[1..]) {
+                *slot = fit_i32(*target - base)?;
+            }
+        }
+        Instruction::LookupSwitch { default, pairs, .. } => {
+            *default = fit_i32(targets[0] - base)?;
+            for ((_, slot), target) in pairs.iter_mut().zip(&targets[1..]) {
+                *slot = fit_i32(*target - base)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Replaces `instructions[range]` with `replacement`, rebasing every branch and
+/// switch offset so that existing targets keep pointing at the same logical
+/// instruction.
+///
+/// Relative offsets carried by `replacement` are interpreted in the *original*
+/// layout: the replacement sequence is treated as laid out starting at the
+/// splice point, so a supplied branch may reference an instruction that was
+/// already present before the edit. Offsets that pointed at an instruction
+/// inside `range` are moved forward to the first instruction after the
+/// replacement.
+///
+/// Returns the instructions that were removed. On error `instructions` is left
+/// unchanged.
+pub(crate) fn splice<'a>(
+    instructions: &mut Vec<Instruction<'a>>,
+    range: Range<usize>,
+    replacement: Vec<Instruction<'a>>,
+) -> Result<Vec<Instruction<'a>>> {
+    let len = instructions.len();
+    let Range { start, end } = range;
+    if start > end || end > len {
+        return Err(Error::InstructionIndexOutOfRange {
+            index: start.max(end),
+            len,
+        });
+    }
+
+    let (old_pcs, old_len) = layout(instructions);
+    let removed_count = end - start;
+    let replacement_len = replacement.len();
+
+    // Lay the replacement out from the splice point in the original coordinate
+    // system so its own relative offsets can be resolved.
+    let edit_start = old_pcs.get(start).copied().unwrap_or(old_len) as i64;
+    let mut replacement_pcs = Vec::with_capacity(replacement_len);
+    let mut cursor = edit_start as usize;
+    for instruction in &replacement {
+        replacement_pcs.push(cursor);
+        cursor += instruction.encoded_len(cursor);
+    }
+
+    // Resolve every target before restructuring.
+    let mut old_targets: Vec<Vec<i64>> = Vec::with_capacity(len);
+    for (index, instruction) in instructions.iter().enumerate() {
+        let mut targets = Vec::new();
+        resolve_targets(instruction, old_pcs[index], &mut targets);
+        old_targets.push(targets);
+    }
+    let mut replacement_targets: Vec<Vec<i64>> = Vec::with_capacity(replacement_len);
+    for (index, instruction) in replacement.iter().enumerate() {
+        let mut targets = Vec::new();
+        resolve_targets(instruction, replacement_pcs[index], &mut targets);
+        replacement_targets.push(targets);
+    }
+
+    // Assemble the new instruction/target sequence.
+    let mut combined: Vec<(Instruction<'a>, Vec<i64>)> =
+        Vec::with_capacity(len - removed_count + replacement_len);
+    for (index, targets) in old_targets.iter_mut().enumerate().take(start) {
+        combined.push((instructions[index].clone(), core::mem::take(targets)));
+    }
+    for (instruction, targets) in replacement.into_iter().zip(replacement_targets) {
+        combined.push((instruction, targets));
+    }
+    for (index, targets) in old_targets.iter_mut().enumerate().skip(end) {
+        combined.push((instructions[index].clone(), core::mem::take(targets)));
+    }
+
+    // Recompute positions. Switch padding depends on the pc, so a surviving
+    // instruction's length can change; mapping target *instructions* (not raw
+    // byte deltas) keeps this correct.
+    let mut new_pcs = Vec::with_capacity(combined.len());
+    let mut new_len = 0usize;
+    for (instruction, _) in &combined {
+        new_pcs.push(new_len);
+        new_len += instruction.encoded_len(new_len);
+    }
+
+    // Map a pre-edit absolute pc to a post-edit absolute pc. A target on an
+    // instruction boundary follows that instruction; a target inside the
+    // removed range moves to the first instruction after the replacement; a
+    // target inside an instruction (malformed input) is shifted by the byte
+    // delta as a best effort.
+    let byte_delta = new_len as i64 - old_len as i64;
+    let map_pc = |t: i64| -> i64 {
+        let boundary = if t >= 0 {
+            old_pcs.binary_search(&(t as usize)).ok()
+        } else {
+            None
+        };
+        if let Some(old_index) = boundary {
+            let new_index = if old_index < start {
+                old_index
+            } else if old_index < end {
+                start + replacement_len
+            } else {
+                old_index - removed_count + replacement_len
+            };
+            return new_pcs
+                .get(new_index)
+                .map_or(new_len as i64, |&pc| pc as i64);
+        }
+        (t + byte_delta).clamp(0, new_len as i64)
+    };
+
+    for (index, (instruction, targets)) in combined.iter_mut().enumerate() {
+        for target in targets.iter_mut() {
+            *target = map_pc(*target);
+        }
+        write_targets(instruction, new_pcs[index], targets)?;
+    }
+
+    let removed = instructions[start..end].to_vec();
+    *instructions = combined
+        .into_iter()
+        .map(|(instruction, _)| instruction)
+        .collect();
+    Ok(removed)
 }
 
 /// Decodes a bytecode array into instructions.
@@ -603,9 +835,10 @@ fn write_padding(writer: &mut Writer, pc: usize, stored: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Instruction, decode_impl, encode_impl, encode_into_impl};
+    use super::{Instruction, decode_impl, encode_impl, encode_into_impl, splice};
     use crate::bytecode::{Opcode, OperandKind};
     use crate::constant_pool::ConstantRef;
+    use crate::error::Error;
     use crate::io::Writer;
 
     #[test]
@@ -847,5 +1080,135 @@ mod tests {
         assert_eq!(&bytes[5..8], &[0xa7, 0x00, 0x05]); // goto offset kept
         assert_eq!(&bytes[8..13], &[0xb9, 0x00, 0x09, 0x03, 0x00]); // invokeinterface
         assert_eq!(&bytes[13..18], &[0xba, 0x00, 0x09, 0x00, 0x00]); // invokedynamic
+    }
+
+    fn nop<'a>() -> Instruction<'a> {
+        Instruction::None(Opcode::Nop)
+    }
+
+    fn ret<'a>() -> Instruction<'a> {
+        Instruction::None(Opcode::Return)
+    }
+
+    #[test]
+    fn splice_insert_before_target_shifts_branch() {
+        // goto -> [2]; nop; return
+        let mut instructions = vec![Instruction::Branch(Opcode::Goto, 4), nop(), ret()];
+        splice(&mut instructions, 1..1, vec![nop()]).expect("splice");
+        assert_eq!(instructions[0], Instruction::Branch(Opcode::Goto, 5));
+    }
+
+    #[test]
+    fn splice_insert_after_target_leaves_branch() {
+        // goto -> [1]; return
+        let mut instructions = vec![Instruction::Branch(Opcode::Goto, 3), ret()];
+        splice(&mut instructions, 2..2, vec![nop()]).expect("splice");
+        assert_eq!(instructions[0], Instruction::Branch(Opcode::Goto, 3));
+    }
+
+    #[test]
+    fn splice_remove_target_redirects_to_next() {
+        // goto -> [2]; nop; nop; return
+        let mut instructions = vec![Instruction::Branch(Opcode::Goto, 4), nop(), nop(), ret()];
+        let removed = splice(&mut instructions, 1..3, Vec::new()).expect("splice");
+        assert_eq!(removed.len(), 2);
+        // The removed range held the target, so the branch now reaches the
+        // instruction that followed it.
+        assert_eq!(instructions[0], Instruction::Branch(Opcode::Goto, 3));
+    }
+
+    #[test]
+    fn splice_replace_target_redirects_after_replacement() {
+        // goto -> [1]; ldc_w; return
+        let mut instructions = vec![
+            Instruction::Branch(Opcode::Goto, 3),
+            Instruction::ConstantWide(Opcode::LdcW, ConstantRef::new(1)),
+            ret(),
+        ];
+        splice(&mut instructions, 1..2, vec![nop(), nop()]).expect("splice");
+        assert_eq!(instructions[0], Instruction::Branch(Opcode::Goto, 5));
+    }
+
+    #[test]
+    fn splice_supplied_branch_references_original_code() {
+        // nop; nop; return  -- a supplied goto whose offset (2) targets the
+        // original `return` is rebased to the post-edit layout.
+        let mut instructions = vec![nop(), nop(), ret()];
+        let goto = Instruction::Branch(Opcode::Goto, 2);
+        splice(&mut instructions, 0..0, vec![goto]).expect("splice");
+        assert_eq!(instructions[0], Instruction::Branch(Opcode::Goto, 5));
+    }
+
+    #[test]
+    fn splice_remaps_switch_targets() {
+        // nop; tableswitch { default -> [2]; case 0 -> [2]; case 1 -> [3] }; return; return
+        let switch = Instruction::TableSwitch {
+            default: 23,
+            low: 0,
+            high: 1,
+            offsets: vec![23, 24],
+            padding: Vec::new(),
+        };
+        let mut instructions = vec![nop(), switch, ret(), ret()];
+        splice(&mut instructions, 0..0, vec![nop()]).expect("splice");
+        let new_pcs = {
+            let mut pcs = Vec::new();
+            let mut pc = 0usize;
+            for instruction in &instructions {
+                pcs.push(pc);
+                pc += instruction.encoded_len(pc);
+            }
+            pcs
+        };
+        // The switch is now at index 2; its targets (default + two cases) must
+        // land on the two trailing `return`s.
+        let base = new_pcs[2] as i64;
+        let Instruction::TableSwitch {
+            default, offsets, ..
+        } = &instructions[2]
+        else {
+            panic!("expected a tableswitch");
+        };
+        let targets: Vec<i64> = std::iter::once(i64::from(*default))
+            .chain(offsets.iter().map(|offset| i64::from(*offset)))
+            .map(|offset| base + offset)
+            .collect();
+        assert_eq!(
+            targets,
+            vec![new_pcs[3] as i64, new_pcs[3] as i64, new_pcs[4] as i64]
+        );
+    }
+
+    #[test]
+    fn splice_overflow_is_an_error_and_leaves_input_unchanged() {
+        // Inserting the filler between the `goto` and its target pushes the
+        // relative offset past `i16::MAX`.
+        let mut instructions = vec![Instruction::Branch(Opcode::Goto, 3), ret()];
+        let filler: Vec<Instruction<'static>> = vec![nop(); 40_000];
+        let result = splice(&mut instructions, 1..1, filler);
+        assert!(matches!(
+            result,
+            Err(Error::RelativeOffsetOutOfRange { .. })
+        ));
+        assert_eq!(instructions.len(), 2);
+    }
+
+    #[test]
+    fn splice_reports_out_of_range() {
+        let mut instructions = vec![nop(), ret()];
+        assert!(matches!(
+            splice(&mut instructions, 0..5, Vec::new()),
+            Err(Error::InstructionIndexOutOfRange { index: 5, len: 2 })
+        ));
+        assert_eq!(instructions.len(), 2);
+    }
+
+    #[test]
+    fn splice_delete_to_end_clamps_target() {
+        // goto -> [1]; nop  -- deleting the target leaves only the goto, whose
+        // target is clamped to the end of the code.
+        let mut instructions = vec![Instruction::Branch(Opcode::Goto, 3), nop()];
+        splice(&mut instructions, 1..2, Vec::new()).expect("splice");
+        assert_eq!(instructions, vec![Instruction::Branch(Opcode::Goto, 3)]);
     }
 }

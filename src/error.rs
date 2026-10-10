@@ -139,4 +139,24 @@ pub enum Error {
         /// The structure being parsed.
         context: &'static str,
     },
+
+    /// An instruction index or range used while editing bytecode was outside
+    /// the method body.
+    #[error("instruction index {index} is out of range (code has {len} instruction(s))")]
+    InstructionIndexOutOfRange {
+        /// The offending index (or the larger bound of an invalid range).
+        index: usize,
+        /// Number of instructions in the body.
+        len: usize,
+    },
+
+    /// Rebasing a branch or switch offset after an edit produced a value that
+    /// does not fit the instruction's field.
+    #[error("relative offset {offset} does not fit in {target}")]
+    RelativeOffsetOutOfRange {
+        /// The offset that did not fit.
+        offset: i64,
+        /// The name of the target field.
+        target: &'static str,
+    },
 }
