@@ -50,6 +50,12 @@ pub enum Error {
         len: usize,
     },
 
+    /// A [`Constant::Invalid`](crate::Constant::Invalid) placeholder was
+    /// serialized. It is a bookkeeping value for unused slots and must not
+    /// appear on the wire.
+    #[error("cannot serialize Constant::Invalid (an unusable constant-pool slot)")]
+    InvalidConstant,
+
     /// A `CONSTANT_Utf8` entry was not valid Java modified UTF-8.
     #[error("invalid modified UTF-8 at offset {offset}: {reason}")]
     InvalidModifiedUtf8 {

@@ -117,7 +117,7 @@ impl<'a> TryFrom<&'a [u8]> for Mutf8<'a> {
     /// skip validation.
     fn try_from(bytes: &'a [u8]) -> Result<Self> {
         let value = Self::new(bytes);
-        value.decode()?;
+        validate(value)?;
         Ok(value)
     }
 }
@@ -167,16 +167,55 @@ impl<'a> TryFrom<&'a str> for Mutf8<'a> {
     }
 }
 
-/// Decodes a Java modified UTF-8 value into an owned [`String`].
+/// A destination for the code points produced while scanning modified UTF-8.
+///
+/// A [`String`] decodes into an owned buffer; the zero-sized `Validate` discards
+/// every code point, so the compiler monomorphizes a validation-only pass that
+/// allocates nothing. This is how [`Mutf8::try_from`] validates without the cost
+/// of building an intermediate `String`.
+trait CharSink {
+    /// Appends one decoded code point.
+    fn push_char(&mut self, c: char);
+    /// Appends one decoded ASCII code point.
+    fn push_ascii(&mut self, b: u8);
+}
+
+impl CharSink for String {
+    #[inline]
+    fn push_char(&mut self, c: char) {
+        self.push(c);
+    }
+
+    #[inline]
+    fn push_ascii(&mut self, b: u8) {
+        self.push(char::from(b));
+    }
+}
+
+/// The validation-only [`CharSink`]: it drops every code point.
+struct Validate;
+
+impl CharSink for Validate {
+    #[inline]
+    fn push_char(&mut self, _c: char) {}
+
+    #[inline]
+    fn push_ascii(&mut self, _b: u8) {}
+}
+
+/// Scans `value`, feeding every code point to `sink` and validating as it goes.
+///
+/// `sink` is statically dispatched, so the `String` instantiation is the
+/// decoding path and the `Validate` instantiation is a no-allocation
+/// validation pass.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidModifiedUtf8`] if the input is malformed, contains
 /// an encoded NUL or otherwise overlong sequence, or contains an unpaired
 /// UTF-16 surrogate.
-pub fn decode(value: Mutf8<'_>) -> Result<String> {
+fn decode_into<S: CharSink>(value: Mutf8<'_>, sink: &mut S) -> Result<()> {
     let bytes = value.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         let b0 = bytes[i];
@@ -187,7 +226,7 @@ pub fn decode(value: Mutf8<'_>) -> Result<String> {
                     "unescaped NUL byte (must be encoded as 0xC0 0x80)",
                 ));
             }
-            out.push(b0 as char);
+            sink.push_ascii(b0);
             i += 1;
             continue;
         }
@@ -201,11 +240,11 @@ pub fn decode(value: Mutf8<'_>) -> Result<String> {
             }
             let cp = ((u32::from(b0) & 0x1F) << 6) | (u32::from(b1) & 0x3F);
             if cp == 0 {
-                out.push('\0');
+                sink.push_char('\0');
             } else if cp < 0x80 {
                 return Err(invalid(i, "overlong 2-byte sequence"));
             } else {
-                out.push(char::from_u32(cp).ok_or_else(|| invalid(i, "invalid code point"))?);
+                sink.push_char(char::from_u32(cp).ok_or_else(|| invalid(i, "invalid code point"))?);
             }
             i += 2;
             continue;
@@ -225,12 +264,14 @@ pub fn decode(value: Mutf8<'_>) -> Result<String> {
                     return Err(invalid(next, "expected low surrogate"));
                 }
                 let combined = 0x1_0000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-                out.push(char::from_u32(combined).ok_or_else(|| invalid(i, "invalid code point"))?);
+                sink.push_char(
+                    char::from_u32(combined).ok_or_else(|| invalid(i, "invalid code point"))?,
+                );
                 i += 6;
             } else if (0xDC00..=0xDFFF).contains(&cp) {
                 return Err(invalid(i, "unpaired low surrogate"));
             } else {
-                out.push(char::from_u32(cp).ok_or_else(|| invalid(i, "invalid code point"))?);
+                sink.push_char(char::from_u32(cp).ok_or_else(|| invalid(i, "invalid code point"))?);
                 i += 3;
             }
             continue;
@@ -238,7 +279,25 @@ pub fn decode(value: Mutf8<'_>) -> Result<String> {
 
         return Err(invalid(i, "invalid lead byte"));
     }
+    Ok(())
+}
+
+/// Decodes a Java modified UTF-8 value into an owned [`String`].
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidModifiedUtf8`] if the input is malformed, contains
+/// an encoded NUL or otherwise overlong sequence, or contains an unpaired
+/// UTF-16 surrogate.
+pub fn decode(value: Mutf8<'_>) -> Result<String> {
+    let mut out = String::with_capacity(value.as_bytes().len());
+    decode_into(value, &mut out)?;
     Ok(out)
+}
+
+/// Validates `value` as modified UTF-8 without allocating.
+fn validate(value: Mutf8<'_>) -> Result<()> {
+    decode_into(value, &mut Validate)
 }
 
 fn decode_three(bytes: &[u8], i: usize) -> Result<u32> {
@@ -438,6 +497,30 @@ mod tests {
         assert_eq!(String::try_from(value).unwrap(), "hello");
         assert!(Mutf8::try_from("a\0b").is_err());
         assert!(Mutf8::try_from("emoji 😀").is_err());
+    }
+
+    #[test]
+    fn validation_matches_decode() {
+        // The allocation-free `try_from` path must accept exactly the inputs the
+        // decoding path accepts.
+        let cases: &[&[u8]] = &[
+            b"",
+            b"ascii",
+            b"h\xC3\xA9llo",
+            &[0xC0, 0x80], // encoded NUL
+            &[0x00],       // unescaped NUL
+            &[0xED, 0xA0, 0x80],
+            &[0xC3],
+            &[0xE3, 0x81],
+            &[0xE2, 0x82, 0xAC],                   // U+20AC
+            &[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80], // U+1F600 surrogate pair
+            &[0xF0, 0x9F, 0x98, 0x80],             // UTF-8 U+1F600
+        ];
+        for bytes in cases {
+            let decoded = decode(Mutf8::new(bytes)).is_ok();
+            let validated = Mutf8::try_from(*bytes).is_ok();
+            assert_eq!(decoded, validated, "mismatch for {bytes:02X?}");
+        }
     }
 
     #[test]

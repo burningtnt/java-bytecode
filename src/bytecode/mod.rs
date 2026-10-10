@@ -91,7 +91,7 @@
 //! descriptor `()V` neither pops nor pushes, so `max_stack` is unchanged.
 //!
 //! ```
-//! use java_bytecode::{ClassFile, Constant, Instruction, Mutf8, Opcode};
+//! use java_bytecode::{ClassFile, Constant, Instruction, Opcode};
 //!
 //! let input: &[u8] = include_bytes!(concat!(
 //!     env!("CARGO_MANIFEST_DIR"),
@@ -100,13 +100,13 @@
 //! let mut class = ClassFile::parse(input).unwrap();
 //!
 //! // 1. Intern `example/Hook.entry()V` and build a Methodref to it.
-//! let class_name = class.constant_pool.intern_utf8(Mutf8::try_from("example/Hook").unwrap()).unwrap();
+//! let class_name = class.constant_pool.intern_utf8("example/Hook").unwrap();
 //! let class_ref = class
 //!     .constant_pool
 //!     .intern(Constant::Class { name_index: class_name })
 //!     .unwrap();
-//! let name = class.constant_pool.intern_utf8(Mutf8::try_from("entry").unwrap()).unwrap();
-//! let descriptor = class.constant_pool.intern_utf8(Mutf8::try_from("()V").unwrap()).unwrap();
+//! let name = class.constant_pool.intern_utf8("entry").unwrap();
+//! let descriptor = class.constant_pool.intern_utf8("()V").unwrap();
 //! let name_and_type = class
 //!     .constant_pool
 //!     .intern(Constant::NameAndType {

@@ -16,7 +16,8 @@
 ## 设计要点
 
 - **纯借用模型**：所有可变长数据由调用方持有，`ClassFile<'a>` 只借用。新增的字符串/字节必须以 `&'a` 传入。
-- **`ConstantRef<'a>`**：由 `ConstantPool::push` / `intern` / `intern_utf8` 返回；`get` / `utf8` / `utf8_str` 等接收该类型。
+- **`ConstantRef<'a>`**：由 `ConstantPool::push` / `intern` / `intern_utf8` 返回；`get` / `utf8` / `utf8_str` 等接收该类型。`intern_utf8` 直接接受 `&'a str`，内部完成 `Mutf8::try_from` 校验。
+- **常量池槽位**：`ConstantPool` 内部用 `Vec<Constant<'a>>` 表示，0 号槽以及 `Long`/`Double` 的第二槽是 `Constant::Invalid` 占位符（不会被序列化）。
 - **`Mutf8<'a>`**：`Constant::Utf8`、`ConstantPool::utf8`、`SourceDebugExtension`、`FieldType::Object`、名称校验等均使用它。
 - **`Instructions` + `apply`**：编辑字节码的正道；`bytecode::decode` / `encode` 因无法管理常量池下标而为 `unsafe`，仅作底层/高级用途。
 
@@ -46,18 +47,18 @@ fn main() -> Result<(), java_bytecode::Error> {
 插桩（在 `voidMethod()V` 前插入对 `example/Hook.entry()V` 的调用）：
 
 ```rust
-use java_bytecode::{ClassFile, Constant, Instruction, Mutf8, Opcode};
+use java_bytecode::{ClassFile, Constant, Instruction, Opcode};
 
 fn instrument(bytes: &[u8]) -> Result<Vec<u8>, java_bytecode::Error> {
     let mut class = ClassFile::parse(bytes)?;
 
     // 1. 添加所需常量。
-    let class_name = class.constant_pool.intern_utf8(Mutf8::try_from("example/Hook")?)?;
+    let class_name = class.constant_pool.intern_utf8("example/Hook")?;
     let class_ref = class
         .constant_pool
         .intern(Constant::Class { name_index: class_name })?;
-    let name = class.constant_pool.intern_utf8(Mutf8::try_from("entry")?)?;
-    let descriptor = class.constant_pool.intern_utf8(Mutf8::try_from("()V")?)?;
+    let name = class.constant_pool.intern_utf8("entry")?;
+    let descriptor = class.constant_pool.intern_utf8("()V")?;
     let name_and_type = class.constant_pool.intern(Constant::NameAndType {
         name_index: name,
         descriptor_index: descriptor,
@@ -85,6 +86,67 @@ fn instrument(bytes: &[u8]) -> Result<Vec<u8>, java_bytecode::Error> {
 ```
 
 > 注意：`apply()` 只负责重新编码字节码。改变代码长度后，分支/switch 偏移、异常表、调试表与 `StackMapTable` 需由调用方自行处理。
+
+## 从零创建类
+
+库没有专门的 builder：`ClassFile` 各字段都是 `pub`，直接拼装即可。先填常量池（`intern` / `intern_utf8` 返回后续结构要引用的 `ConstantRef`），再搭 `ClassFile` / `MethodInfo` / `Attribute`。`CodeAttribute` 的字节码字段私有，但可以用 `CodeAttribute::from_instructions(max_stack, max_locals, instructions)` 从指令列表构建，再用 `into_attribute(name_index)` 包成 `Attribute`（原类文件也可用 `instructions_mut()` 就地编辑）。所有借用数据必须比 `ClassFile` 活得久（`'static` 字面量天然满足）。
+
+```rust
+use java_bytecode::{
+    ClassAccessFlags, ClassFile, CodeAttribute, Constant, ConstantPool, Instruction,
+    MethodAccessFlags, MethodInfo, Opcode,
+};
+
+fn build() -> Result<Vec<u8>, java_bytecode::Error> {
+    let mut pool = ConstantPool::new();
+
+    let this_name = pool.intern_utf8("example/Sender")?;
+    let this_class = pool.intern(Constant::Class { name_index: this_name })?;
+    let super_name = pool.intern_utf8("java/lang/Object")?;
+    let super_class = pool.intern(Constant::Class { name_index: super_name })?;
+    let send_name = pool.intern_utf8("send")?;
+    let send_descriptor = pool.intern_utf8("(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I")?;
+    let code_name = pool.intern_utf8("Code")?;
+
+    // 用指令列表构建方法体：iconst_0; ireturn。
+    // max_stack = 1，max_locals = 3（this + 两个参数）。
+    let code = CodeAttribute::from_instructions(
+        1,
+        3,
+        [Instruction::None(Opcode::Iconst0), Instruction::None(Opcode::Ireturn)],
+    )?;
+
+    let send = MethodInfo {
+        access_flags: MethodAccessFlags::PUBLIC,
+        name_index: send_name,
+        descriptor_index: send_descriptor,
+        attributes: vec![code.into_attribute(code_name)],
+    };
+
+    let class = ClassFile {
+        minor_version: 0,
+        major_version: 52,
+        constant_pool: pool,
+        access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+        this_class,
+        super_class,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        methods: vec![send],
+        attributes: Vec::new(),
+    };
+
+    class.to_bytes()
+}
+```
+
+要点：
+
+- 非静态方法 `max_locals` 含 `this`（此处 3）；加 `ACC_STATIC` 后应改为 2。
+- `abstract` / `native` 方法不能带 `Code` 属性，`attributes` 留空即可。
+- 上面的方法体只返回 0；要写真正的逻辑，往指令列表里加 `Instruction` 即可，有分支/跳转时还要处理偏移与 `StackMapTable`。
+- 更省事的替代方案：用 `javac` 生成带目标签名的骨架类，`ClassFile::parse` 后再改常量池/名字。
+- 冒烟测试见 `tests/create.rs`。
 
 ## 运行示例
 

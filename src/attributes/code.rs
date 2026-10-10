@@ -2,7 +2,7 @@
 
 use core::ops::{Deref, DerefMut};
 
-use super::{Attribute, parse_attributes, write_attributes};
+use super::{Attribute, AttributeBody, parse_attributes, write_attributes};
 use crate::bytecode::{self, Instruction};
 use crate::constant_pool::{ConstantPool, ConstantRef};
 use crate::error::Result;
@@ -52,6 +52,11 @@ impl Eq for CodeBytes<'_> {}
 ///
 /// The raw bytecode is private; use [`CodeAttribute::instructions_mut`] to edit
 /// it, which accounts for the constant-pool scope.
+///
+/// To create a `Code` attribute from scratch, use [`CodeAttribute::new`] (an
+/// empty body) or [`CodeAttribute::from_instructions`], then optionally attach
+/// it with [`CodeAttribute::into_attribute`]. See the crate-level docs and
+/// `tests/create.rs`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodeAttribute<'a> {
     /// Maximum operand stack depth.
@@ -94,6 +99,76 @@ impl<'a> CodeAttribute<'a> {
             exception_table,
             attributes,
         })
+    }
+
+    /// Creates an empty `Code` attribute with no instructions and no exception
+    /// handlers.
+    ///
+    /// `max_stack` is the maximum operand-stack depth; `max_locals` is the
+    /// number of local-variable slots, which must include `this` for instance
+    /// methods. Populate the body with [`CodeAttribute::set_instructions`] or
+    /// [`CodeAttribute::instructions_mut`].
+    #[must_use]
+    pub fn new(max_stack: u16, max_locals: u16) -> Self {
+        Self {
+            max_stack,
+            max_locals,
+            code: CodeBytes::Owned(Box::<[u8]>::default()),
+            exception_table: Vec::new(),
+            attributes: Vec::new(),
+        }
+    }
+
+    /// Builds a `Code` attribute by encoding `instructions`.
+    ///
+    /// This is the from-scratch counterpart of
+    /// [`CodeAttribute::instructions_mut`]: it lets you assemble a bytecode
+    /// body as a list of [`Instruction`]s without hand-writing the attribute
+    /// bytes. The instructions' constant-pool indices must belong to the pool
+    /// of the class this attribute will be attached to; the shared lifetime
+    /// `'a` enforces this.
+    ///
+    /// # Errors
+    ///
+    /// Fails if an instruction cannot be encoded (for example an `ldc` whose
+    /// constant-pool index does not fit in one byte).
+    pub fn from_instructions(
+        max_stack: u16,
+        max_locals: u16,
+        instructions: impl IntoIterator<Item = Instruction<'a>>,
+    ) -> Result<Self> {
+        let mut code = Self::new(max_stack, max_locals);
+        code.set_instructions(instructions)?;
+        Ok(code)
+    }
+
+    /// Encodes `instructions` and installs them, replacing any existing
+    /// bytecode.
+    ///
+    /// The exception table and sub-attributes are left untouched. This is the
+    /// encoding counterpart of [`Instructions::apply`].
+    ///
+    /// # Errors
+    ///
+    /// As for [`CodeAttribute::from_instructions`].
+    pub fn set_instructions(
+        &mut self,
+        instructions: impl IntoIterator<Item = Instruction<'a>>,
+    ) -> Result<()> {
+        let instructions: Vec<Instruction<'a>> = instructions.into_iter().collect();
+        let encoded = bytecode::encode_impl(&instructions)?;
+        self.code = CodeBytes::Owned(encoded.into_boxed_slice());
+        Ok(())
+    }
+
+    /// Wraps this attribute into an [`Attribute`] whose name is `name_index`
+    /// (the interned `Utf8` `"Code"`).
+    #[must_use]
+    pub fn into_attribute(self, name_index: ConstantRef<'a>) -> Attribute<'a> {
+        Attribute {
+            name_index,
+            body: AttributeBody::Code(self),
+        }
     }
 
     /// Returns the raw bytecode bytes.
@@ -245,5 +320,74 @@ impl<'a> Deref for Instructions<'a, '_> {
 impl DerefMut for Instructions<'_, '_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.instructions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttributeBody, CodeAttribute};
+    use crate::Instruction;
+    use crate::bytecode::Opcode;
+    use crate::constant_pool::ConstantRef;
+    use crate::error::Error;
+
+    #[test]
+    fn new_creates_an_empty_attribute() {
+        let code = CodeAttribute::new(2, 4);
+        assert_eq!(code.max_stack, 2);
+        assert_eq!(code.max_locals, 4);
+        assert!(code.code().is_empty());
+        assert!(code.instructions().unwrap().is_empty());
+        assert!(code.exception_table.is_empty());
+        assert!(code.attributes.is_empty());
+    }
+
+    #[test]
+    fn from_instructions_encodes_and_decodes() {
+        let instructions = [
+            Instruction::None(Opcode::Iconst0),
+            Instruction::None(Opcode::Ireturn),
+        ];
+        let code = CodeAttribute::from_instructions(1, 3, instructions).unwrap();
+        assert_eq!(code.code(), &[0x03, 0xAC]);
+        let opcodes: Vec<_> = code
+            .instructions()
+            .unwrap()
+            .iter()
+            .map(Instruction::opcode)
+            .collect();
+        assert_eq!(opcodes, [Opcode::Iconst0, Opcode::Ireturn]);
+    }
+
+    #[test]
+    fn set_instructions_replaces_the_body() {
+        let mut code = CodeAttribute::new(0, 0);
+        code.set_instructions([Instruction::None(Opcode::Return)])
+            .unwrap();
+        assert_eq!(code.code(), &[0xB1]);
+
+        code.set_instructions([
+            Instruction::None(Opcode::Nop),
+            Instruction::None(Opcode::Return),
+        ])
+        .unwrap();
+        assert_eq!(code.code(), &[0x00, 0xB1]);
+    }
+
+    #[test]
+    fn set_instructions_reports_encode_errors() {
+        let mut code = CodeAttribute::new(1, 0);
+        // `ldc` cannot reference a constant-pool index above 255.
+        let result =
+            code.set_instructions([Instruction::Constant(Opcode::Ldc, ConstantRef::new(300))]);
+        assert!(matches!(result, Err(Error::ValueTooLarge { .. })));
+    }
+
+    #[test]
+    fn into_attribute_wraps_the_body() {
+        let name = ConstantRef::new(1);
+        let attribute = CodeAttribute::new(0, 0).into_attribute(name);
+        assert_eq!(attribute.name_index, name);
+        assert!(matches!(attribute.body, AttributeBody::Code(_)));
     }
 }

@@ -79,7 +79,7 @@ fn build_plan<'a>(class: &ClassFile<'a>) -> Option<(Vec<u16>, ConstantPool<'a>)>
     let old_len = class.constant_pool.len().max(1);
     let mut remap: Vec<u16> = (0..old_len).map(|i| i as u16).collect();
 
-    let mut entries: Vec<Option<Constant<'a>>> = vec![None];
+    let mut entries: Vec<Constant<'a>> = vec![Constant::Invalid];
     let mut assigned: Vec<(Constant<'a>, u16)> = Vec::new();
     let mut next: u16 = 1;
 
@@ -93,9 +93,9 @@ fn build_plan<'a>(class: &ClassFile<'a>) -> Option<(Vec<u16>, ConstantPool<'a>)>
         }
         let new = next;
         let two_slots = constant.takes_two_slots();
-        entries.push(Some(constant.clone()));
+        entries.push(constant.clone());
         if two_slots {
-            entries.push(None);
+            entries.push(Constant::Invalid);
             next = next.checked_add(2)?;
         } else {
             next = next.checked_add(1)?;
@@ -144,7 +144,8 @@ fn constant_refs(constant: &Constant<'_>) -> Vec<u16> {
         | Constant::Integer(_)
         | Constant::Float(_)
         | Constant::Long(_)
-        | Constant::Double(_) => Vec::new(),
+        | Constant::Double(_)
+        | Constant::Invalid => Vec::new(),
         Constant::Class { name_index } | Constant::Module { name_index } => {
             vec![name_index.get()]
         }

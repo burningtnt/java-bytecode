@@ -157,6 +157,11 @@ impl<'a> Attribute<'a> {
 
 impl<'a> AttributeBody<'a> {
     /// Decodes a body given the attribute `name`.
+    ///
+    /// This interprets the raw `info` bytes of an attribute as read from a class
+    /// file. To build a typed body from scratch, prefer the type's own
+    /// constructor (for example [`CodeAttribute::from_instructions`]); fall back
+    /// to [`AttributeBody::parse`] only when you already have `info` bytes.
     pub fn parse(
         name: Mutf8<'a>,
         bytes: &'a [u8],

@@ -171,6 +171,12 @@ pub enum Constant<'a> {
         /// Index of the `Utf8` package name.
         name_index: ConstantRef<'a>,
     },
+    /// An unusable constant-pool slot.
+    ///
+    /// Occupies index 0 of every constant pool and the second slot of a
+    /// `Long`/`Double`. It is never serialized and [`Constant::tag`] returns the
+    /// sentinel `0`.
+    Invalid,
 }
 
 fn read_ref<'a>(reader: &mut Reader<'a>) -> Result<ConstantRef<'a>> {
@@ -179,6 +185,8 @@ fn read_ref<'a>(reader: &mut Reader<'a>) -> Result<ConstantRef<'a>> {
 
 impl Constant<'_> {
     /// Returns the wire tag byte of this constant.
+    ///
+    /// [`Constant::Invalid`] is not a real entry and returns the sentinel `0`.
     #[must_use]
     pub const fn tag(&self) -> u8 {
         match self {
@@ -199,6 +207,7 @@ impl Constant<'_> {
             Self::InvokeDynamic { .. } => 18,
             Self::Module { .. } => 19,
             Self::Package { .. } => 20,
+            Self::Invalid => 0,
         }
     }
 
@@ -305,7 +314,15 @@ impl Constant<'_> {
     }
 
     /// Serializes this entry (tag byte included) into `writer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidConstant`] for [`Constant::Invalid`], which is a
+    /// bookkeeping placeholder and must not appear on the wire.
     pub fn write_to(&self, writer: &mut Writer) -> Result<()> {
+        if matches!(self, Self::Invalid) {
+            return Err(Error::InvalidConstant);
+        }
         writer.write_u1(self.tag());
         match self {
             Self::Utf8(value) => {
@@ -364,6 +381,8 @@ impl Constant<'_> {
                 writer.write_cp_u2(name_and_type_index.get());
             }
             Self::Package { name_index } => writer.write_cp_u2(name_index.get()),
+            // Rejected above; this arm only satisfies exhaustiveness.
+            Self::Invalid => {}
         }
         Ok(())
     }
@@ -371,12 +390,12 @@ impl Constant<'_> {
 
 /// The constant pool table.
 ///
-/// Index 0 is unused (always `None`). `Long` and `Double` constants occupy two
-/// slots; the second slot is represented by `None`, mirroring the on-disk
-/// layout so that indices remain stable for byte-exact round-trips.
+/// Index 0 and the second slot of every `Long`/`Double` are [`Constant::Invalid`]
+/// placeholders, mirroring the on-disk slot layout so that indices remain stable
+/// for byte-exact round-trips.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConstantPool<'a> {
-    entries: Vec<Option<Constant<'a>>>,
+    entries: Vec<Constant<'a>>,
 }
 
 impl<'a> ConstantPool<'a> {
@@ -384,13 +403,13 @@ impl<'a> ConstantPool<'a> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: vec![None],
+            entries: vec![Constant::Invalid],
         }
     }
 
-    /// Creates a pool from raw entries (index 0 must be `None`).
+    /// Creates a pool from raw entries (index 0 must be [`Constant::Invalid`]).
     #[must_use]
-    pub(crate) fn from_entries(entries: Vec<Option<Constant<'a>>>) -> Self {
+    pub(crate) fn from_entries(entries: Vec<Constant<'a>>) -> Self {
         Self { entries }
     }
 
@@ -401,13 +420,13 @@ impl<'a> ConstantPool<'a> {
         if count == 0 {
             return Ok(Self { entries });
         }
-        entries.push(None); // index 0 is unused
+        entries.push(Constant::Invalid); // index 0 is unused
         while entries.len() < count {
             let constant = Constant::parse(reader)?;
             let two_slots = constant.takes_two_slots();
-            entries.push(Some(constant));
+            entries.push(constant);
             if two_slots {
-                entries.push(None);
+                entries.push(Constant::Invalid);
             }
         }
         Ok(Self { entries })
@@ -416,8 +435,11 @@ impl<'a> ConstantPool<'a> {
     /// Writes `constant_pool_count` followed by every entry.
     pub fn write_to(&self, writer: &mut Writer) -> Result<()> {
         writer.write_u2_len(self.entries.len())?;
-        for constant in self.entries.iter().skip(1).flatten() {
-            constant.write_to(writer)?;
+        for constant in self.entries.iter().skip(1) {
+            match constant {
+                Constant::Invalid => {}
+                constant => constant.write_to(writer)?,
+            }
         }
         Ok(())
     }
@@ -434,21 +456,34 @@ impl<'a> ConstantPool<'a> {
         self.entries.len() <= 1
     }
 
-    /// Returns the constant at `index`, or `None` if it is unused/out of range.
+    /// Returns the constant at `index`, or `None` if it is a placeholder
+    /// ([`Constant::Invalid`]) or out of range.
     #[must_use]
     pub fn get(&self, index: ConstantRef<'a>) -> Option<&Constant<'a>> {
-        self.entries.get(index.get() as usize)?.as_ref()
+        match self.entries.get(index.get() as usize)? {
+            Constant::Invalid => None,
+            constant => Some(constant),
+        }
     }
 
     /// Crate-internal lookup by raw index (used by the rebuild pass).
     #[must_use]
     pub(crate) fn entry(&self, index: u16) -> Option<&Constant<'a>> {
-        self.entries.get(index as usize)?.as_ref()
+        match self.entries.get(index as usize)? {
+            Constant::Invalid => None,
+            constant => Some(constant),
+        }
     }
 
     /// Returns a mutable reference to the constant at `index`.
+    ///
+    /// Returns `None` for placeholder ([`Constant::Invalid`]) or out-of-range
+    /// slots.
     pub fn get_mut(&mut self, index: ConstantRef<'a>) -> Option<&mut Constant<'a>> {
-        self.entries.get_mut(index.get() as usize)?.as_mut()
+        match self.entries.get_mut(index.get() as usize)? {
+            Constant::Invalid => None,
+            constant => Some(constant),
+        }
     }
 
     /// Appends a constant and returns a reference to it.
@@ -457,16 +492,16 @@ impl<'a> ConstantPool<'a> {
     /// to the first slot.
     pub fn push(&mut self, constant: Constant<'a>) -> Result<ConstantRef<'a>> {
         if self.entries.is_empty() {
-            self.entries.push(None);
+            self.entries.push(Constant::Invalid);
         }
         let index = u16::try_from(self.entries.len()).map_err(|_| Error::ValueTooLarge {
             value: self.entries.len() as u64,
             target: "u16 (constant pool index)",
         })?;
         let two_slots = constant.takes_two_slots();
-        self.entries.push(Some(constant));
+        self.entries.push(constant);
         if two_slots {
-            self.entries.push(None);
+            self.entries.push(Constant::Invalid);
         }
         Ok(ConstantRef::new(index))
     }
@@ -488,16 +523,29 @@ impl<'a> ConstantPool<'a> {
         self.push(constant)
     }
 
-    /// Interns a `CONSTANT_Utf8` value.
-    pub fn intern_utf8(&mut self, value: Mutf8<'a>) -> Result<ConstantRef<'a>> {
-        self.intern(Constant::Utf8(value))
+    /// Interns a `CONSTANT_Utf8` value for `value`.
+    ///
+    /// `value` is validated with [`Mutf8::try_from`] and the resulting entry
+    /// borrows it for the pool's lifetime `'a`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidModifiedUtf8`] if `value` contains U+0000 or a
+    /// supplementary character, which standard UTF-8 represents but modified
+    /// UTF-8 does not.
+    pub fn intern_utf8(&mut self, value: &'a str) -> Result<ConstantRef<'a>> {
+        self.intern(Constant::Utf8(Mutf8::try_from(value)?))
     }
 
-    /// Iterates over `(reference, constant)` pairs, skipping unused slots.
+    /// Iterates over `(reference, constant)` pairs, skipping placeholder
+    /// ([`Constant::Invalid`]) slots.
     pub fn iter(&self) -> impl Iterator<Item = (ConstantRef<'a>, &Constant<'a>)> {
         self.entries.iter().enumerate().filter_map(|(i, entry)| {
             let index = u16::try_from(i).ok()?;
-            Some((ConstantRef::new(index), entry.as_ref()?))
+            match entry {
+                Constant::Invalid => None,
+                constant => Some((ConstantRef::new(index), constant)),
+            }
         })
     }
 
@@ -579,5 +627,43 @@ mod tests {
         let a: Vec<_> = pool.iter().collect();
         let b: Vec<_> = reparsed.iter().collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn invalid_slots_are_not_serialized() {
+        let mut pool = ConstantPool::new();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.get(ConstantRef::new(0)), None);
+        pool.push(Constant::Long(7)).unwrap();
+
+        let mut writer = Writer::new();
+        pool.write_to(&mut writer).unwrap();
+        // `constant_pool_count = 3`, then the tag-5 `Long` and its 8 payload
+        // bytes. The index-0 placeholder and the `Long`'s second slot are
+        // `Constant::Invalid` and are not emitted.
+        assert_eq!(writer.into_bytes(), [0, 3, 5, 0, 0, 0, 0, 0, 0, 0, 7]);
+    }
+
+    #[test]
+    fn invalid_constant_is_a_sentinel() {
+        assert_eq!(Constant::Invalid.tag(), 0);
+        let mut writer = Writer::new();
+        assert!(matches!(
+            Constant::Invalid.write_to(&mut writer),
+            Err(crate::error::Error::InvalidConstant)
+        ));
+        assert!(writer.into_bytes().is_empty());
+    }
+
+    #[test]
+    fn intern_utf8_accepts_str_and_validates() {
+        let mut pool = ConstantPool::new();
+        let first = pool.intern_utf8("hello").unwrap();
+        let second = pool.intern_utf8("hello").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(pool.utf8(first).unwrap(), "hello");
+        // Modified UTF-8 rejects NUL and supplementary characters.
+        assert!(pool.intern_utf8("a\0b").is_err());
+        assert!(pool.intern_utf8("emoji 😀").is_err());
     }
 }

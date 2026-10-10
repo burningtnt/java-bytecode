@@ -40,15 +40,82 @@
 //!     new_name: &'a str,
 //! ) -> Result<Vec<u8>, java_bytecode::Error> {
 //!     let mut class = ClassFile::parse(bytes)?;
-//!     let index = class
-//!         .constant_pool
-//!         .intern_utf8(java_bytecode::Mutf8::try_from(new_name)?)?;
+//!     let index = class.constant_pool.intern_utf8(new_name)?;
 //!     if let Some(method) = class.methods.first_mut() {
 //!         method.name_index = index;
 //!     }
 //!     class.to_bytes()
 //! }
 //! ```
+//!
+//! # Creating a class from scratch
+//!
+//! There is no dedicated builder: a [`ClassFile`] is assembled from its public
+//! fields. Fill the [`ConstantPool`] first (its `intern`/`intern_utf8` methods
+//! return the [`ConstantRef`]s every other structure refers to), then build the
+//! class, its methods and their attributes as plain struct literals.
+//!
+//! [`CodeAttribute`] is the one exception: its bytecode field is private, so a
+//! `Code` attribute is built from an instruction list with
+//! [`CodeAttribute::from_instructions`] and attached with
+//! [`CodeAttribute::into_attribute`] (or edited in place through
+//! [`CodeAttribute::instructions_mut`]). Every borrowed payload must outlive the
+//! class file; `'static` strings and literals satisfy that automatically.
+//!
+//! ```
+//! use java_bytecode::{
+//!     ClassAccessFlags, ClassFile, CodeAttribute, Constant, ConstantPool, Instruction,
+//!     MethodAccessFlags, MethodInfo, Opcode,
+//! };
+//!
+//! fn build() -> Result<Vec<u8>, java_bytecode::Error> {
+//!     let mut pool = ConstantPool::new();
+//!
+//!     let this_name = pool.intern_utf8("example/Sender")?;
+//!     let this_class = pool.intern(Constant::Class { name_index: this_name })?;
+//!     let super_name = pool.intern_utf8("java/lang/Object")?;
+//!     let super_class = pool.intern(Constant::Class { name_index: super_name })?;
+//!     let send_name = pool.intern_utf8("send")?;
+//!     let send_descriptor =
+//!         pool.intern_utf8("(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I")?;
+//!     let code_name = pool.intern_utf8("Code")?;
+//!
+//!     // Build the method body from instructions: `iconst_0; ireturn`.
+//!     let code = CodeAttribute::from_instructions(
+//!         1, // max_stack
+//!         3, // max_locals: `this` + two arguments
+//!         [Instruction::None(Opcode::Iconst0), Instruction::None(Opcode::Ireturn)],
+//!     )?;
+//!
+//!     let send = MethodInfo {
+//!         access_flags: MethodAccessFlags::PUBLIC,
+//!         name_index: send_name,
+//!         descriptor_index: send_descriptor,
+//!         attributes: vec![code.into_attribute(code_name)],
+//!     };
+//!
+//!     let class = ClassFile {
+//!         minor_version: 0,
+//!         major_version: 52,
+//!         constant_pool: pool,
+//!         access_flags: ClassAccessFlags::PUBLIC | ClassAccessFlags::SUPER,
+//!         this_class,
+//!         super_class,
+//!         interfaces: Vec::new(),
+//!         fields: Vec::new(),
+//!         methods: vec![send],
+//!         attributes: Vec::new(),
+//!     };
+//!
+//!     class.to_bytes()
+//! }
+//!
+//! # build().unwrap();
+//! ```
+//!
+//! A method that must not carry code (`abstract` or `native`) is created the same
+//! way with an empty `attributes` vector, so no synthetic `Code` attribute is
+//! needed. See `tests/create.rs` for these cases.
 //!
 //! # Modifying bytecode (instrumentation)
 //!

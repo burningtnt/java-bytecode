@@ -22,24 +22,15 @@ fn edits_instructions_through_the_scoped_view() {
     let mut class = ClassFile::parse(&bytes).expect("parse");
 
     // Intern `example/Hook.entry()V` and build a Methodref to it.
-    let class_name = class
-        .constant_pool
-        .intern_utf8(Mutf8::try_from("example/Hook").unwrap())
-        .unwrap();
+    let class_name = class.constant_pool.intern_utf8("example/Hook").unwrap();
     let class_ref = class
         .constant_pool
         .intern(Constant::Class {
             name_index: class_name,
         })
         .unwrap();
-    let name = class
-        .constant_pool
-        .intern_utf8(Mutf8::try_from("entry").unwrap())
-        .unwrap();
-    let descriptor = class
-        .constant_pool
-        .intern_utf8(Mutf8::try_from("()V").unwrap())
-        .unwrap();
+    let name = class.constant_pool.intern_utf8("entry").unwrap();
+    let descriptor = class.constant_pool.intern_utf8("()V").unwrap();
     let name_and_type = class
         .constant_pool
         .intern(Constant::NameAndType {
@@ -93,10 +84,7 @@ fn renames_a_method_by_interning_a_new_utf8() {
     let bytes = fixture("Simple.class");
     let mut class = ClassFile::parse(&bytes).expect("parse");
 
-    let renamed = class
-        .constant_pool
-        .intern_utf8(Mutf8::try_from("addTwo").unwrap())
-        .expect("intern");
+    let renamed = class.constant_pool.intern_utf8("addTwo").expect("intern");
 
     let method = class
         .find_method_mut("add", "(IJ)J")
@@ -115,8 +103,10 @@ fn append_only_write_keeps_existing_indices() {
     let mut class = ClassFile::parse(&bytes).expect("parse");
 
     let before = class.constant_pool.len();
-    let appended = Mutf8::try_from("unused-but-valid").unwrap();
-    let index = class.constant_pool.intern_utf8(appended).expect("intern");
+    let index = class
+        .constant_pool
+        .intern_utf8("unused-but-valid")
+        .expect("intern");
     // `into_raw` is `unsafe`: we promise the index belongs to `class`.
     let raw = unsafe { index.into_raw() };
     assert_eq!(raw as usize, before); // first free slot
@@ -126,9 +116,14 @@ fn append_only_write_keeps_existing_indices() {
     // A reference from the parsed file is scoped to *it*, so fetch it there.
     let found = reparsed
         .constant_pool
-        .find(&Constant::Utf8(appended))
+        .find(&Constant::Utf8(
+            Mutf8::try_from("unused-but-valid").unwrap(),
+        ))
         .expect("interned constant present");
-    assert_eq!(reparsed.constant_pool.utf8(found).unwrap(), appended);
+    assert_eq!(
+        reparsed.constant_pool.utf8(found).unwrap(),
+        "unused-but-valid"
+    );
     assert_eq!(unsafe { found.into_raw() }, raw);
     // Appending one constant adds exactly one pool slot.
     assert_eq!(reparsed.constant_pool.len(), before + 1);
@@ -142,7 +137,7 @@ fn rebuild_drops_unused_constants() {
     let original_len = class.constant_pool.len();
     let _ = class
         .constant_pool
-        .intern_utf8(Mutf8::try_from("completely-unused").unwrap())
+        .intern_utf8("completely-unused")
         .expect("intern");
 
     let rebuilt = class.to_bytes_rebuilt().expect("rebuild");
@@ -198,14 +193,8 @@ fn interns_are_deduplicated() {
     let bytes = fixture("Simple.class");
     let mut class = ClassFile::parse(&bytes).expect("parse");
 
-    let first = class
-        .constant_pool
-        .intern_utf8(Mutf8::try_from("dup").unwrap())
-        .expect("intern");
-    let second = class
-        .constant_pool
-        .intern_utf8(Mutf8::try_from("dup").unwrap())
-        .expect("intern");
+    let first = class.constant_pool.intern_utf8("dup").expect("intern");
+    let second = class.constant_pool.intern_utf8("dup").expect("intern");
     assert_eq!(first, second);
     assert_eq!(
         class.constant_pool.get(first),
