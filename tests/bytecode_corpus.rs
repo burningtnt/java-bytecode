@@ -43,20 +43,16 @@ impl Stats {
 fn corpus_dir() -> Option<PathBuf> {
     if let Ok(value) = std::env::var("JAVA_BYTECODE_CORPUS") {
         let dir = PathBuf::from(value);
-        let mut files = Vec::new();
-        common::collect_class_files(&dir, &mut files);
-        if !files.is_empty() {
+        if dir.is_dir() {
             return Some(dir);
         }
         eprintln!(
-            "warning: JAVA_BYTECODE_CORPUS={} contains no class files",
+            "warning: JAVA_BYTECODE_CORPUS={} is not a directory",
             dir.display()
         );
     }
     let default = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jdk-corpus");
-    let mut files = Vec::new();
-    common::collect_class_files(&default, &mut files);
-    (!files.is_empty()).then_some(default)
+    default.is_dir().then_some(default)
 }
 
 fn check_file(path: &Path, stats: &mut Stats) {

@@ -15,6 +15,11 @@ use java_bytecode::bytecode::{Instruction, decode, encode};
 use java_bytecode::{Attribute, AttributeBody, ClassFile, CodeAttribute};
 
 /// Recursively collects `.class` files under `dir`.
+///
+/// Uses [`std::fs::DirEntry::file_type`] (which reads the `d_type` from the
+/// directory entry where the filesystem provides it) instead of `Path::is_dir`,
+/// avoiding an extra `stat` per entry; on network/DrvFS-style mounts that stat is
+/// the dominant cost.
 pub fn collect_class_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -22,8 +27,11 @@ pub fn collect_class_files(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         };
         for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|ext| ext == "class") {
                 out.push(path);

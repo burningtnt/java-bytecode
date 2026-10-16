@@ -47,26 +47,15 @@ fn main() -> Result<(), java_bytecode::Error> {
 插桩（在 `int dense(int)` 的方法头插入对 `example/Hook.entry()V` 的调用）：
 
 ```rust
-use java_bytecode::{ClassFile, Constant, Instruction, Opcode};
+use java_bytecode::{ClassFile, Instruction, Opcode};
 
 fn instrument(bytes: &[u8]) -> Result<Vec<u8>, java_bytecode::Error> {
     let mut class = ClassFile::parse(bytes)?;
 
-    // 1. 添加所需常量。
-    let class_name = class.constant_pool.intern_utf8("example/Hook")?;
-    let class_ref = class
+    // 1. 添加 Methodref 常量（内部会自动 intern Utf8/Class/NameAndType）。
+    let method_ref = class
         .constant_pool
-        .intern(Constant::Class { name_index: class_name })?;
-    let name = class.constant_pool.intern_utf8("entry")?;
-    let descriptor = class.constant_pool.intern_utf8("()V")?;
-    let name_and_type = class.constant_pool.intern(Constant::NameAndType {
-        name_index: name,
-        descriptor_index: descriptor,
-    })?;
-    let method_ref = class.constant_pool.intern(Constant::Methodref {
-        class_index: class_ref,
-        name_and_type_index: name_and_type,
-    })?;
+        .intern_method("example/Hook", "entry", "()V", false)?;
 
     // 2. 通过作用域绑定的视图编辑并写回；分支/switch 偏移自动重定位。
     {
@@ -169,3 +158,12 @@ JAVA_BYTECODE_CORPUS=tests/fixtures/jdk-corpus cargo test --release --test bytec
 ```
 
 该测试会对每个 `Code` 做整段与指令级往返、`encoded_len` 一致性、分支目标边界校验。最近一次在 OpenJDK 25 上：27054 个类、214853 个 `Code`、约 1248 万条指令，0 失败。
+
+- **javap 文本对比测试**（`tests/javap.rs`，不含在库里）：用一个测试专用的 javap 兼容渲染器（`tests/javap_support/`）把每个 `.class` 渲染成文本，再调用 `javap -p -c -v`，逐字符比较两份输出。fixtures 默认运行；语料通过 `JAVA_BYTECODE_CORPUS`（或 `tests/fixtures/jdk-corpus`）开启。参考 javap 通过 `JAVA_BYTECODE_JAVAP` / `JAVA_HOME/bin/javap` / `/tmp/opencode/jdk-27/bin/javap` 定位（Windows 上会同时尝试 `javap.exe`），必须是 Java 27。
+
+```bash
+cargo test --release --test javap
+JAVA_BYTECODE_CORPUS=tests/fixtures/jdk-corpus cargo test --release --test javap -- --nocapture
+```
+
+  可通过 `JAVA_BYTECODE_JOBS`（工作线程数）与 `JAVA_BYTECODE_BATCH`（每次 javap 处理的 `.class` 数量，摊薄 JVM 启动）调优；`JAVA_BYTECODE_CORPUS_MAX` 限制语料规模。最近一次在 JDK 27 语料上：27347 个类全部逐字符一致，0 失败。

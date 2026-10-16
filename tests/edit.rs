@@ -18,28 +18,9 @@ fn fixture(name: &str) -> Vec<u8> {
 
 /// Interns `example/Hook.entry()V` and returns a `Methodref` to it.
 fn intern_hook<'a>(class: &mut ClassFile<'a>) -> ConstantRef<'a> {
-    let class_name = class.constant_pool.intern_utf8("example/Hook").unwrap();
-    let class_ref = class
-        .constant_pool
-        .intern(Constant::Class {
-            name_index: class_name,
-        })
-        .unwrap();
-    let name = class.constant_pool.intern_utf8("entry").unwrap();
-    let descriptor = class.constant_pool.intern_utf8("()V").unwrap();
-    let name_and_type = class
-        .constant_pool
-        .intern(Constant::NameAndType {
-            name_index: name,
-            descriptor_index: descriptor,
-        })
-        .unwrap();
     class
         .constant_pool
-        .intern(Constant::Methodref {
-            class_index: class_ref,
-            name_and_type_index: name_and_type,
-        })
+        .intern_method("example/Hook", "entry", "()V", false)
         .unwrap()
 }
 

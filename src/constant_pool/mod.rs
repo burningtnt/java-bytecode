@@ -537,6 +537,49 @@ impl<'a> ConstantPool<'a> {
         self.intern(Constant::Utf8(Mutf8::try_from(value)?))
     }
 
+    /// Interns a `CONSTANT_Methodref` for `class`.`name` with `descriptor`.
+    ///
+    /// `class` is an internal class name (for example `"example/Hook"`), `name`
+    /// the method name and `descriptor` the method descriptor. `interface`
+    /// selects a `CONSTANT_InterfaceMethodref` instead of a
+    /// `CONSTANT_Methodref`. The `Utf8`, `Class` and `NameAndType` entries it
+    /// depends on are interned (deduplicated) as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidModifiedUtf8`] for the same reason as
+    /// [`ConstantPool::intern_utf8`], or [`Error::ValueTooLarge`] if the pool
+    /// would exceed `u16::MAX` entries.
+    pub fn intern_method(
+        &mut self,
+        class: &'a str,
+        name: &'a str,
+        descriptor: &'a str,
+        interface: bool,
+    ) -> Result<ConstantRef<'a>> {
+        let class_name = self.intern_utf8(class)?;
+        let class_index = self.intern(Constant::Class {
+            name_index: class_name,
+        })?;
+        let name_index = self.intern_utf8(name)?;
+        let descriptor_index = self.intern_utf8(descriptor)?;
+        let name_and_type_index = self.intern(Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        })?;
+        if interface {
+            self.intern(Constant::InterfaceMethodref {
+                class_index,
+                name_and_type_index,
+            })
+        } else {
+            self.intern(Constant::Methodref {
+                class_index,
+                name_and_type_index,
+            })
+        }
+    }
+
     /// Iterates over `(reference, constant)` pairs, skipping placeholder
     /// ([`Constant::Invalid`]) slots.
     pub fn iter(&self) -> impl Iterator<Item = (ConstantRef<'a>, &Constant<'a>)> {
@@ -665,5 +708,35 @@ mod tests {
         // Modified UTF-8 rejects NUL and supplementary characters.
         assert!(pool.intern_utf8("a\0b").is_err());
         assert!(pool.intern_utf8("emoji 😀").is_err());
+    }
+
+    #[test]
+    fn intern_method_builds_a_deduplicated_methodref() {
+        let mut pool = ConstantPool::new();
+        let first = pool
+            .intern_method("example/Hook", "entry", "()V", false)
+            .unwrap();
+        let second = pool
+            .intern_method("example/Hook", "entry", "()V", false)
+            .unwrap();
+        assert_eq!(first, second);
+
+        let Some(Constant::Methodref {
+            class_index,
+            name_and_type_index,
+        }) = pool.get(first)
+        else {
+            panic!("expected a Methodref");
+        };
+        assert_eq!(pool.class_name(*class_index).unwrap(), "example/Hook");
+        let Some(Constant::NameAndType {
+            name_index,
+            descriptor_index,
+        }) = pool.get(*name_and_type_index)
+        else {
+            panic!("expected a NameAndType");
+        };
+        assert_eq!(pool.utf8_str(*name_index).unwrap(), "entry");
+        assert_eq!(pool.utf8_str(*descriptor_index).unwrap(), "()V");
     }
 }

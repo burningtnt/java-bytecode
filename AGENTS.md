@@ -30,6 +30,7 @@ Operational guide for AI coding assistants working on `java-bytecode`. Imperativ
 - Regenerate javac-25 fixtures (needs `javac`): `./scripts/gen_fixtures.sh`
 - Fetch OpenJDK 25 corpus (network): `./scripts/fetch_jdk_corpus.sh`
 - Large corpus test: `JAVA_BYTECODE_CORPUS=tests/fixtures/jdk-corpus cargo test --release --test bytecode_corpus -- --nocapture`
+- javap output test (needs a Java 27 `javap`; set `JAVA_BYTECODE_JAVAP`): `cargo test --release --test javap`. Corpus: `JAVA_BYTECODE_CORPUS=tests/fixtures/jdk-corpus cargo test --release --test javap -- --nocapture` (tune with `JAVA_BYTECODE_JOBS` / `JAVA_BYTECODE_BATCH` / `JAVA_BYTECODE_CORPUS_MAX`).
 
 ## 3. Code Style & Conventions
 

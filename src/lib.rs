@@ -115,7 +115,7 @@
 //!
 //! A method that must not carry code (`abstract` or `native`) is created the same
 //! way with an empty `attributes` vector, so no synthetic `Code` attribute is
-//! needed. See `tests/create.rs` for these cases.
+//! needed.
 //!
 //! # Modifying bytecode (instrumentation)
 //!

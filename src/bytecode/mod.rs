@@ -98,7 +98,7 @@
 //! reach the same case bodies.
 //!
 //! ```
-//! use java_bytecode::{ClassFile, Constant, Instruction, Opcode};
+//! use java_bytecode::{ClassFile, Instruction, Opcode};
 //!
 //! let input: &[u8] = include_bytes!(concat!(
 //!     env!("CARGO_MANIFEST_DIR"),
@@ -106,27 +106,10 @@
 //! ));
 //! let mut class = ClassFile::parse(input).unwrap();
 //!
-//! // 1. Intern `example/Hook.entry()V` and build a Methodref to it.
-//! let class_name = class.constant_pool.intern_utf8("example/Hook").unwrap();
-//! let class_ref = class
-//!     .constant_pool
-//!     .intern(Constant::Class { name_index: class_name })
-//!     .unwrap();
-//! let name = class.constant_pool.intern_utf8("entry").unwrap();
-//! let descriptor = class.constant_pool.intern_utf8("()V").unwrap();
-//! let name_and_type = class
-//!     .constant_pool
-//!     .intern(Constant::NameAndType {
-//!         name_index: name,
-//!         descriptor_index: descriptor,
-//!     })
-//!     .unwrap();
+//! // 1. Intern `example/Hook.entry()V` as a Methodref.
 //! let method_ref = class
 //!     .constant_pool
-//!     .intern(Constant::Methodref {
-//!         class_index: class_ref,
-//!         name_and_type_index: name_and_type,
-//!     })
+//!     .intern_method("example/Hook", "entry", "()V", false)
 //!     .unwrap();
 //!
 //! // 2. Record the tableswitch's default offset before editing.
